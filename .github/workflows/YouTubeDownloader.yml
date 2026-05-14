@@ -1,4 +1,4 @@
-name: 🎯 YouTube Downloader
+name: 🎯 YouTube Downloader Pro
 
 on:
   workflow_dispatch:
@@ -40,6 +40,41 @@ on:
         required: false
         type: number
         default: 50
+      subtitles:
+        description: '📝 Download subtitles'
+        required: false
+        type: boolean
+        default: false
+      qualities:
+        description: 'Multiple qualities (comma: 360,720,1080) - leave empty for single'
+        required: false
+        type: string
+        default: ''
+      priority:
+        description: '⭐ Priority order'
+        required: false
+        type: choice
+        options:
+          - default
+          - most_views
+          - newest_first
+          - shortest_first
+        default: 'default'
+      create_podcast:
+        description: '🎙️ Create podcast from playlist'
+        required: false
+        type: boolean
+        default: false
+      generate_rss:
+        description: '📡 Generate RSS feed'
+        required: false
+        type: boolean
+        default: false
+      schedule_mode:
+        description: '⏱️ Smart scheduling (only download in low traffic hours)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   PYTHONUNBUFFERED: '1'
@@ -47,7 +82,7 @@ env:
 
 jobs:
   download-and-process:
-    name: 🚀 YouTube Downloader
+    name: 🚀 YouTube Downloader Pro
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -69,6 +104,7 @@ jobs:
           python3 -c "import requests" 2>/dev/null || pip3 install -q requests
           command -v yt-dlp &>/dev/null || pip3 install -q yt-dlp
           command -v zip &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq zip)
+          command -v ffmpeg &>/dev/null || (sudo apt-get install -y -qq ffmpeg)
 
       - name: 🔗 Prepare
         id: prep
@@ -88,12 +124,19 @@ jobs:
           QUALITY: ${{ github.event.inputs.quality }}
           MAX: ${{ github.event.inputs.max_videos }}
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
+          SUBTITLES: ${{ github.event.inputs.subtitles }}
+          QUALITIES: ${{ github.event.inputs.qualities }}
+          PRIORITY: ${{ github.event.inputs.priority }}
+          CREATE_PODCAST: ${{ github.event.inputs.create_podcast }}
+          GENERATE_RSS: ${{ github.event.inputs.generate_rss }}
+          SCHEDULE_MODE: ${{ github.event.inputs.schedule_mode }}
         run: |
           python3 << 'PYEOF'
           import os, json, time, re, subprocess, sys, hashlib
           import requests as rq
           from pathlib import Path
           from datetime import datetime
+          from collections import defaultdict
 
           M = os.environ['MODE']
           U = os.environ['URL']
@@ -101,6 +144,20 @@ jobs:
           Q = os.environ.get('QUALITY', '720')
           MX = int(os.environ.get('MAX', '10'))
           SP = int(os.environ.get('SPLIT', '50'))
+          SUBTITLES = os.environ.get('SUBTITLES', 'false').lower() == 'true'
+          MULTI_QUALITIES = [q.strip() for q in os.environ.get('QUALITIES', '').split(',') if q.strip()]
+          PRIORITY = os.environ.get('PRIORITY', 'default')
+          CREATE_PODCAST = os.environ.get('CREATE_PODCAST', 'false').lower() == 'true'
+          GENERATE_RSS = os.environ.get('GENERATE_RSS', 'false').lower() == 'true'
+          SCHEDULE_MODE = os.environ.get('SCHEDULE_MODE', 'false').lower() == 'true'
+
+          # Smart scheduling - فقط در ساعات خلوت دانلود کن
+          if SCHEDULE_MODE:
+              current_hour = datetime.now().hour
+              if not (2 <= current_hour <= 6):
+                  print(f"⏰ Smart scheduling: Current hour {current_hour} is not in low-traffic window (2-6 AM)")
+                  print("   Exiting to save resources. Run again during low-traffic hours.")
+                  sys.exit(0)
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -110,6 +167,21 @@ jobs:
               'Content-Type': 'application/json',
               'Origin': 'https://media.ytmp3.gg'
           }
+
+          # Archive system - جلوگیری از دانلود مجدد
+          ARCHIVE_FILE = 'downloaded_archive.txt'
+          
+          def load_archive():
+              if Path(ARCHIVE_FILE).exists():
+                  with open(ARCHIVE_FILE, 'r') as f:
+                      return set(line.strip() for line in f)
+              return set()
+          
+          def mark_downloaded(video_id):
+              with open(ARCHIVE_FILE, 'a') as f:
+                  f.write(f"{video_id}\n")
+          
+          downloaded_ids = load_archive()
 
           def safe_name(text, maxlen=40):
               safe = re.sub(r'[^\w]', '_', text)[:maxlen]
@@ -140,38 +212,30 @@ jobs:
                       views = d.get('view_count')
                       duration = d.get('duration', 0)
                       channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
+                      upload_date = d.get('upload_date', '')
                       handle = None
-                      # Try to get @handle from channel_url
                       if channel_url:
                           m = re.search(r'@([\w-]+)', channel_url)
                           if m: handle = m.group(1)
-                      # Fallback: use channel name as folder name
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
-                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle, upload_date)
               except: pass
-              return ('Unknown', None, 0, None)
+              return ('Unknown', None, 0, None, '')
 
           def get_channel_from_url(url):
-              """Extract channel identifier from any YouTube URL"""
-              # Try @handle
               m = re.search(r'@([\w-]+)', url)
               if m: return m.group(1)
-              # Try channel/ID
               m = re.search(r'channel/([\w-]+)', url)
               if m: return m.group(1)
-              # Try c/name
               m = re.search(r'c/([\w-]+)', url)
               if m: return m.group(1)
-              # Try /user/name
               m = re.search(r'user/([\w-]+)', url)
               if m: return m.group(1)
               return None
 
           def get_channel_from_playlist(playlist_url):
-              """Get the actual channel name from a playlist by looking at its first video"""
               try:
-                  # Get first video from playlist
                   cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
                          '--no-warnings', '--no-check-certificate', playlist_url]
                   r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -179,25 +243,21 @@ jobs:
                       d = json.loads(r.stdout.strip().split('\n')[0])
                       vid = d.get('id', '')
                       if vid:
-                          _, _, _, handle = gv(vid)
+                          _, _, _, handle, _ = gv(vid)
                           if handle: return handle
-                      # Fallback to uploader/channel from flat data
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
                       if ch: return safe_name(ch, 30)
               except: pass
               return None
 
           def gvl(u, n):
-              """Get video list - returns (videos, channel_folder_name)"""
-              # Step 1: Try to get channel from URL pattern
+              """Get video list with priority sorting"""
               channel_folder = get_channel_from_url(u)
               
-              # Step 2: If playlist and no channel found, get from first video
               if not channel_folder and 'playlist' in u:
                   print(f'   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
               
-              # Step 3: Last resort
               if not channel_folder:
                   channel_folder = 'playlist_videos'
               
@@ -218,7 +278,7 @@ jobs:
                           title = d.get('title', 'Untitled')[:60]
                           print(f'   📊 [{len(v)+1}/{n}] {title}...')
                           
-                          ch, vw, dr, _ = gv(vid)
+                          ch, vw, dr, _, upload_date = gv(vid)
                           
                           if not ch or ch == 'Unknown':
                               ch = (d.get('channel') or d.get('uploader') or 
@@ -232,13 +292,32 @@ jobs:
                               'dr': int(dr) if dr else 0,
                               'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
                               'c': str(ch).strip() if ch else 'Unknown',
-                              'v': fm(vw)
+                              'v': fm(vw),
+                              'views_raw': int(vw) if vw else 0,
+                              'upload_date': upload_date
                           })
                       except Exception as e:
                           print(f'      ⚠️ Skip: {str(e)[:40]}')
                           continue
               
-              return v, channel_folder
+              # Apply priority sorting
+              if PRIORITY == 'most_views':
+                  v.sort(key=lambda x: x['views_raw'], reverse=True)
+                  print(f"   🏆 Sorted by: Most views")
+              elif PRIORITY == 'newest_first':
+                  v.sort(key=lambda x: x['upload_date'], reverse=True)
+                  print(f"   📅 Sorted by: Newest first")
+              elif PRIORITY == 'shortest_first':
+                  v.sort(key=lambda x: x['dr'])
+                  print(f"   ⏱️ Sorted by: Shortest duration")
+              
+              # Filter already downloaded videos
+              new_videos = [vid for vid in v if vid['id'] not in downloaded_ids]
+              skipped = len(v) - len(new_videos)
+              if skipped > 0:
+                  print(f"   💾 Skipping {skipped} already downloaded videos")
+              
+              return new_videos, channel_folder
 
           def mkidx(v, cn, cd):
               ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -280,11 +359,30 @@ jobs:
               print(f'📄 Index: {idxf}')
               return idxf
 
-          def dl_video(u):
+          def download_subtitles(video_url, output_path):
+              if not SUBTITLES:
+                  return None
+              try:
+                  # Download both manual and auto-generated subs
+                  sub_file = output_path.with_suffix('.en.vtt')
+                  subprocess.run(['yt-dlp', '--write-subs', '--sub-lang', 'en,fa,ar',
+                                 '--write-auto-subs', '--sub-format', 'vtt',
+                                 '-o', str(output_path.with_suffix('')), video_url],
+                                 capture_output=True, timeout=30)
+                  if sub_file.exists():
+                      print(f'      📝 Subtitles downloaded')
+                      return sub_file
+              except:
+                  pass
+              return None
+
+          def dl_video(u, quality=Q):
               e = 'mp3' if T == 'audio' else 'mp4'
               p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
-              if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
-              else: p['output']['quality'] = f'{Q}p'
+              if T == 'audio': 
+                  p['audio'] = {'bitrate': f'{quality}k'}
+              else: 
+                  p['output']['quality'] = f'{quality}p'
 
               for retry in range(3):
                   if retry > 0:
@@ -343,8 +441,61 @@ jobs:
                   return True
               return False
 
+          def create_podcast_from_playlist(videos, channel_name):
+              if not CREATE_PODCAST or len(videos) < 2:
+                  return
+              print(f'\n🎙️ Creating podcast from {len(videos)} videos...')
+              audio_files = []
+              for i, v in enumerate(videos):
+                  # First check if audio file exists
+                  audio_path = Path(f'downloads/{channel_name}_videos/v{i+1:03d}_{v["id"]}.mp3')
+                  if audio_path.exists():
+                      audio_files.append(str(audio_path))
+              
+              if len(audio_files) > 1:
+                  # Create concat list
+                  with open('concat_list.txt', 'w') as f:
+                      for audio in audio_files:
+                          f.write(f"file '{audio}'\n")
+                  
+                  podcast_path = f'downloads/{channel_name}_podcast.mp3'
+                  subprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0', 
+                                 '-i', 'concat_list.txt', '-c', 'copy', podcast_path], 
+                                 capture_output=True)
+                  print(f'   ✅ Podcast created: {podcast_path}')
+
+          def generate_rss_feed(videos, channel_name):
+              if not GENERATE_RSS or not videos:
+                  return
+              print(f'\n📡 Generating RSS feed...')
+              rss = f'''<?xml version="1.0" encoding="UTF-8"?>
+              <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+              <channel>
+              <title>{channel_name} - YouTube Archive</title>
+              <link>https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}</link>
+              <description>Auto-downloaded YouTube content from {channel_name}</description>
+              <language>en</language>
+              <lastBuildDate>{datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}</lastBuildDate>
+              '''
+              for v in videos[:50]:  # Last 50 videos
+                  rss += f'''
+                  <item>
+                      <title>{v['t']}</title>
+                      <link>{v['u']}</link>
+                      <guid>{v['id']}</guid>
+                      <description>Channel: {v['c']} | Views: {v['v']}</description>
+                      <pubDate>{datetime.now().strftime('%a, %d %b %Y %H:%M:%S GMT')}</pubDate>
+                  </item>'''
+              
+              rss += '</channel></rss>'
+              rss_path = f'downloads/{channel_name}_feed.rss'
+              Path(rss_path).write_text(rss)
+              print(f'   ✅ RSS feed: {rss_path}')
+
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
+          if SCHEDULE_MODE:
+              print(f'⏰ Smart Scheduling: ENABLED')
           print(f'{"="*50}')
 
           if M == 'search':
@@ -384,27 +535,48 @@ jobs:
               print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
               
               for i, x in enumerate(v, 1):
+                  if x['id'] in downloaded_ids:
+                      print(f'\n💾 [{i}/{len(v)}] Skipping {x["t"]} (already downloaded)')
+                      continue
+                      
                   print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
                   print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
                   
-                  result = dl_video(x['u'])
-                  if result:
-                      fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
-                      size = download_file(result['u'], fp)
-                      if size:
-                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
-                          split_file(fp, SP)
-                          ok.append(x['t'])
+                  # Determine qualities to download
+                  qualities_to_download = MULTI_QUALITIES if MULTI_QUALITIES else [Q]
+                  
+                  for quality in qualities_to_download:
+                      print(f'   🎯 Quality: {quality}p')
+                      result = dl_video(x['u'], quality)
+                      if result:
+                          suffix = f'_{quality}' if len(qualities_to_download) > 1 else ''
+                          fp = cd / f'v{i:03d}_{x["id"]}{suffix}.{result["e"]}'
+                          size = download_file(result['u'], fp)
+                          if size:
+                              print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                              split_file(fp, SP)
+                              # Download subtitles for this video
+                              download_subtitles(x['u'], fp)
+                              ok.append(f"{x['t']} ({quality}p)")
+                          else:
+                              print(f'   ❌ Download failed')
+                              fl.append(x['t'])
                       else:
-                          print(f'   ❌ Download failed')
+                          print(f'   ❌ Conversion failed')
                           fl.append(x['t'])
-                  else:
-                      print(f'   ❌ Conversion failed')
-                      fl.append(x['t'])
+                  
+                  # Mark as downloaded in archive
+                  mark_downloaded(x['id'])
                   
                   if i < len(v): 
                       print(f'   ⏳ Waiting...')
                       time.sleep(2)
+              
+              # Create podcast if requested
+              create_podcast_from_playlist(v, cn)
+              
+              # Generate RSS feed if requested
+              generate_rss_feed(v, cn)
 
               Path('/tmp/meta.json').write_text(json.dumps({
                   'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
@@ -419,23 +591,55 @@ jobs:
               vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
               vid = vid_match.group(1) if vid_match else 'x'
               
-              # Get channel from the video itself
-              ch, _, _, handle = gv(vid)
+              # Skip if already downloaded
+              if vid in downloaded_ids:
+                  print(f'💾 Video already downloaded, skipping...')
+                  sys.exit(0)
+              
+              ch, _, _, handle, _ = gv(vid)
               cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
               
-              result = dl_video(U)
-              if result:
-                  cd = Path(f'downloads/{cn}_videos')
-                  cd.mkdir(parents=True, exist_ok=True)
-                  fp = cd / f'v_{vid}.{result["e"]}'
-                  size = download_file(result['u'], fp)
-                  if size:
-                      print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
-                      split_file(fp, SP)
-              else:
-                  print('❌ Failed'); sys.exit(1)
+              # Determine qualities to download
+              qualities_to_download = MULTI_QUALITIES if MULTI_QUALITIES else [Q]
+              
+              for quality in qualities_to_download:
+                  print(f'🎯 Downloading with quality: {quality}p')
+                  result = dl_video(U, quality)
+                  if result:
+                      cd = Path(f'downloads/{cn}_videos')
+                      cd.mkdir(parents=True, exist_ok=True)
+                      suffix = f'_{quality}' if len(qualities_to_download) > 1 else ''
+                      fp = cd / f'v_{vid}{suffix}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                          download_subtitles(U, fp)
+                          mark_downloaded(vid)
+                      else:
+                          print('❌ Failed'); sys.exit(1)
+                  else:
+                      print('❌ Failed'); sys.exit(1)
           
           PYEOF
+
+      - name: 📊 Generate Report
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 DOWNLOAD REPORT"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ -f downloaded_archive.txt ]; then
+            COUNT=$(wc -l < downloaded_archive.txt)
+            echo "📈 Total videos downloaded to date: $COUNT"
+          fi
+          
+          echo ""
+          echo "📁 Files structure:"
+          find downloads -type f -name "*.mp4" -o -name "*.mp3" 2>/dev/null | head -20 | while read f; do
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "   📎 $(basename "$f") ($SIZE)"
+          done
 
       - name: 📤 Push Files
         run: |
